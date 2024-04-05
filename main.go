@@ -1,9 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
-	"context"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math"
@@ -14,8 +15,6 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/montanaflynn/stats"
 )
@@ -90,56 +89,52 @@ func main() {
 
 	bootstrapCount := 0
 
-	var parentBlockHash *common.Hash
-	for {
-		var block *types.Block
-		if parentBlockHash == nil {
-			block, err = client.BlockByNumber(context.Background(), blockNum)
-		} else {
-			block, err = client.BlockByHash(context.Background(), *parentBlockHash)
-		}
+	// Open the file
+	file, err := os.Open("op_post_ecotone_txs_result.bin")
+	if err != nil {
+		fmt.Println("open file failed", err)
+		return
+	}
+	defer file.Close()
+	// Create a scanner
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	// Read and print lines
+	for scanner.Scan() {
+		line := scanner.Text()
+		decodedTx, err := hex.DecodeString(line)
 		if err != nil {
-			log.Fatal(err)
+			fmt.Println("decode tx hex failed", err)
+			return
 		}
-		if block == nil {
-			log.Fatal("not enough blocks")
+		if len(decodedTx) < minTxSize {
+			continue
 		}
-		p := block.ParentHash()
-		parentBlockHash = &p
-		//fmt.Println("Blocknum:", blockNum, "Txs:", len(columns[0]))
-		for _, tx := range block.Transactions() {
-			if tx.Type() == types.DepositTxType {
-				continue
-			}
-			b, err := tx.MarshalBinary()
-			if err != nil {
-				log.Fatal(err)
-			}
-			if len(b) < minTxSize {
-				continue
-			}
-			if spanBatchMode {
-				// for span batch mode we trim the signature, and assume there is no estimation
-				// error on this component were we to just treat it as entirely uncompressible.
-				b = b[:len(b)-68.]
-			}
-			if bootstrapCount < bootstrapTxs {
-				zlibBestBatchEstimator(b)
-				bootstrapCount++
-				continue
-			}
-			for j := range estimators {
-				estimate := estimators[j](b)
-				columns[j] = append(columns[j], estimate)
-			}
-			if len(columns[0])%1000 == 0 {
-				fmt.Println(len(columns[0]), "out of", txsToFetch)
-			}
+		if spanBatchMode {
+			// for span batch mode we trim the signature, and assume there is no estimation
+			// error on this component were we to just treat it as entirely uncompressible.
+			decodedTx = decodedTx[:len(decodedTx)-68.]
 		}
-		if len(columns[0]) > txsToFetch {
-			fmt.Println("Reached tx limit. Txs:", len(columns[0]), "Last block fetched:", block.Number())
-			break
+		if bootstrapCount < bootstrapTxs {
+			zlibBestBatchEstimator(decodedTx)
+			bootstrapCount++
+			continue
 		}
+		for j := range estimators {
+			estimate := estimators[j](decodedTx)
+			columns[j] = append(columns[j], estimate)
+		}
+		if len(columns[0])%1000000 == 0 {
+			fmt.Println(len(columns[0]), "tx parsed")
+		}
+
+	}
+	// Check for errors
+	if err := scanner.Err(); err != nil {
+		fmt.Println(err)
+		panic(err)
 	}
 
 	// print summary statistics of entire dataset
@@ -150,8 +145,8 @@ func main() {
 	start := 0
 	end := len(columns[0])
 	if separateTrainTest {
-		// train only on the older transactions (those that come last)
-		start = end / 2
+		// train only on the newer transactions (those that come first)
+		end = end / 5
 	}
 	trainColumns := make([][]float64, len(estimators))
 	for j := range trainColumns {
@@ -179,8 +174,8 @@ func main() {
 	start = 0
 	end = len(columns[0])
 	if separateTrainTest {
-		// evaluate the functions only over newer transactions (those that came first)
-		end = (end / 2) - 1
+		// evaluate the functions only over older transactions (those that came last)
+		start = (end / 5) + 1
 	}
 	testColumns := make([][]float64, len(estimators))
 	for j := range testColumns {
@@ -472,7 +467,7 @@ func fastLZEstimator(tx []byte) float64 {
 }
 
 func fastLZWithUpperBoundEstimator(tx []byte) float64 {
-	fastLZSize := fastLZEstimator(tx) 
+	fastLZSize := fastLZEstimator(tx)
 	if fastLZSize > float64(len(tx)) {
 		return float64(len(tx))
 	}
